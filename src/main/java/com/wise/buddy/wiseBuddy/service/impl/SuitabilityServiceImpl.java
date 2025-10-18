@@ -9,7 +9,6 @@ import com.wise.buddy.wiseBuddy.repository.UserRepository;
 import com.wise.buddy.wiseBuddy.service.SuitabilityService;
 import org.springframework.stereotype.Service;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 

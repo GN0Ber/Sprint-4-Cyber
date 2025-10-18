@@ -1,21 +1,31 @@
-# Etapa 1: Usar uma imagem base com JDK (Java Development Kit)
-FROM openjdk:17-jdk-slim
+# ================================
+# 📦 STAGE 1: Build com Maven
+# ================================
+FROM maven:3.9-eclipse-temurin-17 AS build
+WORKDIR /src
 
-# Etapa 2: Configurar diretório de trabalho dentro do contêiner
+# Copia arquivos de config e baixa dependências (cache otimizado)
+COPY pom.xml .
+RUN mvn -B -q -DskipTests dependency:go-offline
+
+# Copia o restante do código e compila
+COPY src ./src
+RUN mvn -B -DskipTests package
+
+# ================================
+# 🚀 STAGE 2: Runtime com JRE enxuto
+# ================================
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 
-# Etapa 3: Copiar o arquivo JAR gerado pelo Spring Boot para o contêiner
-COPY target/wiseBuddy-0.0.1-SNAPSHOT.jar app.jar
+# Copia o JAR gerado no estágio de build
+COPY --from=build /src/target/*-SNAPSHOT.jar app.jar
 
-# Criar usuário/grupo sem privilégios e ajustar permissões
-RUN groupadd -r app && useradd -r -g app app \
-    && chown -R app:app /app
+# Porta padrão da API
+EXPOSE 8085
 
-# Trocar para usuário não-root
-USER app
-
-# Definir o perfil ativo como prod
+# Carregar variáveis de ambiente do Docker Compose (.env)
 ENV SPRING_PROFILES_ACTIVE=prod
 
-# Etapa 4: Especificar o comando para iniciar a aplicação
+# Iniciar aplicação
 ENTRYPOINT ["java", "-jar", "app.jar"]

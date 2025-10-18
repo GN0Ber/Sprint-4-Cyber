@@ -1,36 +1,44 @@
 package com.wise.buddy.wiseBuddy.model;
 
-import jakarta.persistence.Entity;
 import jakarta.persistence.*;
-import jakarta.persistence.Table;
-
 import java.time.LocalDateTime;
+
+// Import do conversor de criptografia (LGPD)
+import com.wise.buddy.wiseBuddy.crypto.AesGcmConverter;
 
 @Entity
 @Table(name = "user")
 public class UserModel {
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column(name = "user_id")
     private Long Id;
-    @Column(name = "name")
+
+    @Column(name = "name", nullable = false, length = 100)
     private String name;
-    @Column(name = "surname")
+
+    @Column(name = "surname", nullable = false, length = 100)
     private String surname;
-    @Column(name = "email")
+
+    // Campo de dado pessoal sensível – agora criptografado em repouso (LGPD)
+    @Convert(converter = AesGcmConverter.class)
+    @Column(name = "email", nullable = false, unique = true, length = 255)
     private String email;
-    @Column(name = "password_hash")
+
+    @Column(name = "password_hash", nullable = false, length = 255)
     private String passwordHash;
+
     @Column(name = "income_range")
     private String incomeRange;
+
     @Column(name = "sing_on_date")
     private LocalDateTime signOnDate;
 
-    public UserModel() {
-    }
+    public UserModel() {}
 
     public UserModel(Long id, String name, String surname, String email, String passwordHash, String incomeRange, LocalDateTime signOnDate) {
-        Id = id;
+        this.Id = id;
         this.name = name;
         this.surname = surname;
         this.email = email;

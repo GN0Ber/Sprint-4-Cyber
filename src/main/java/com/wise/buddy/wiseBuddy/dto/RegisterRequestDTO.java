@@ -1,17 +1,27 @@
 package com.wise.buddy.wiseBuddy.dto;
 
+import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 
 public class RegisterRequestDTO {
 
     @NotBlank
+    @Size(min = 2, max = 100)
     private String name;
+
     @NotBlank
+    @Size(min = 2, max = 100)
     private String surname;
+
     @NotBlank
+    @Email
     private String email;
+
     @NotBlank
+    @Size(min = 8, max = 64)
     private String password;
+
     private String incomeRange;
 
     public RegisterRequestDTO() {}

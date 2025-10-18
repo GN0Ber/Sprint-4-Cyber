@@ -1,7 +1,5 @@
 package com.wise.buddy.wiseBuddy.dto;
 
-import jakarta.validation.constraints.NotBlank;
-
 public class LoginResponseDTO {
     private Long id;
 
