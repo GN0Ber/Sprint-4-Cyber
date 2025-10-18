@@ -24,7 +24,7 @@ jobs:
 
     env:
       # chave efêmera só pro job (evita NPE no AesGcmConverter)
-      PII_AES_KEY: ${{ secrets.PII_AES_KEY || 'ZmFrZUFwaUtleUZvckpvYg==' }}
+      PII_AES_KEY: ${{ secrets.PII_AES_KEY }}
 
     steps:
       - uses: actions/checkout@v4
