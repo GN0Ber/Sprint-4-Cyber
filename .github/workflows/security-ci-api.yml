@@ -244,12 +244,11 @@ jobs:
       - name: Fail on Semgrep (ERROR only) + print findings
         run: |
           echo "=== Semgrep findings (resumo) ==="
-          jq -r '.results[] | "\(.extra.severity)\t\(.check_id)\t\(.path):\(.start.line)\t\(.extra.message)"' semgrep-java.json || true
+          jq -r '.results[] | "\(.extra.severity)\t(\(.check_id))\t\(.path):\(.start.line)\t\(.extra.message)"' semgrep-java.json || true
           echo "=== END ==="
-          # gate: só ERROR quebra o pipeline
+          # gate: se houver ERROR, quebra o pipeline
           jq -e '[.results[] | select(.extra.severity=="ERROR")] | length == 0' semgrep-java.json \
-          || (echo "Semgrep ERRORs found" && exit 1)
-
+          || (echo "Semgrep ERRORS found" && exit 1)
 
       - name: Fail on DepCheck CVSS >= 9
         run: |
