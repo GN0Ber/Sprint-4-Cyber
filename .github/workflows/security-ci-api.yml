@@ -23,7 +23,7 @@ jobs:
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
           --health-interval=10s --health-timeout=5s --health-retries=10
 
-    # Variables (não coloque segredos em texto, use Secrets do GitHub)
+    # Variáveis (use GitHub Secrets para segredos)
     env:
       DB_URL: jdbc:mysql://127.0.0.1:3306/wisebuddy
       DB_USER: root
@@ -34,7 +34,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure jq
+      - name: Ensure jq & mysql-client
         run: sudo apt-get update && sudo apt-get install -y jq mysql-client
 
       # ---------- SAST (Semgrep) ----------
@@ -62,7 +62,6 @@ jobs:
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
-          # usamos detect simples, sem args “extras” para evitar o warning de inputs
           args: detect --no-banner --redact --report-format json --report-path gitleaks.json
         continue-on-error: true
 
@@ -127,7 +126,7 @@ jobs:
             --spring.profiles.active=prod \
             --spring.datasource.url="${DB_URL}" \
             --spring.datasource.username="${DB_USER}" \
-            --spring.datasource.password="${DB_PASS}" > api.log 2>&1 &
+            --spring.datasource.password="${DB_PASS}" > api.log 2>&1 & \
           echo $! > api.pid
 
       - name: Wait API readiness
@@ -187,14 +186,11 @@ jobs:
           const sgAll = [...semgrepJava.results, ...semgrepJs.results];
           const sevOrder = {ERROR:3, WARNING:2, INFO:1, LOW:1, MEDIUM:2, HIGH:3};
           const sgCounts = sgAll.reduce((a,r)=>{ const s=r.extra?.severity||'INFO'; a[s]=(a[s]||0)+1; return a; },{});
-          const sgTop = sgAll.sort((a,b)=> (sevOrder[b.extra?.severity||'INFO'] - sevOrder[a.extra?.severity||'INFO'])).slice(0,20);
-          const zapAlerts = [];
-          (zap.site||[]).forEach(site=> (site.alerts||[]).forEach(a=> zapAlerts.push(a)));
+          const zapAlerts = []; (zap.site||[]).forEach(site=> (site.alerts||[]).forEach(a=> zapAlerts.push(a)));
           const riskOrder = { 'High':3, 'Medium':2, 'Low':1, 'Informational':0, 'Info':0 };
           const zapCounts = zapAlerts.reduce((a,z)=>{ const r=z.risk||'Info'; a[r]=(a[r]||0)+1; return a; },{});
-          const zapTop = zapAlerts.sort((a,b)=> (riskOrder[b.risk||'Info'] - riskOrder[a.risk||'Info'])).slice(0,15);
           const deps = (depcheck.dependencies||[]).flatMap(d=>{
-            const vulns = d.vulnerabilities||[];
+            const vulns = d.vulnerabilities||[]; 
             return vulns.map(v=>({name:d.fileName||d.name||'unknown', id:v.name||v.cve||'', score:v.cvssScore||v.cvssv3?.baseScore||0, severity:v.severity||'', desc:v.description||''}));
           });
           const scaCounts = deps.reduce((a,v)=>{ a[v.severity]=(a[v.severity]||0)+1; return a; },{});
