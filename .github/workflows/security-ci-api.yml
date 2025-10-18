@@ -22,6 +22,10 @@ jobs:
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
           --health-interval=10s --health-timeout=5s --health-retries=10
 
+    env:
+      # chave efêmera só pro job (evita NPE no AesGcmConverter)
+      PII_AES_KEY: ${{ secrets.PII_AES_KEY || 'ZmFrZUFwaUtleUZvckpvYg==' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -83,40 +87,59 @@ jobs:
           mv dependency-check-report.json security-reports/api/depcheck.json || true
 
       # ---------- Seed + subir API para DAST ----------
-      - name: Seed DB
+      - name: Wait MySQL healthy
+        run: |
+          for i in {1..30}; do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then
+              echo "MySQL UP"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL didn't start in time"; exit 1
+
+      - name: Seed DB (tabela e colunas do seu modelo 'user')
         run: |
           cat > seed.sql <<'SQL'
-          CREATE TABLE IF NOT EXISTS users (
-            id BIGINT PRIMARY KEY AUTO_INCREMENT,
-            name VARCHAR(100), email VARCHAR(120) UNIQUE,
-            password VARCHAR(255), role VARCHAR(20)
+          CREATE TABLE IF NOT EXISTS user (
+            user_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            name VARCHAR(100) NOT NULL,
+            surname VARCHAR(100) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            income_range VARCHAR(255),
+            sing_on_date DATETIME(6)
           );
-          INSERT IGNORE INTO users (name,email,password,role) VALUES
-            ('Admin','admin@wisebuddy.dev', SHA2('Admin@123',256), 'ADMIN'),
-            ('User','user@wisebuddy.dev',  SHA2('User@123',256),  'USER');
+          INSERT IGNORE INTO user (name, surname, email, password_hash, income_range, sing_on_date)
+          VALUES ('Admin','Root','admin@wisebuddy.dev', SHA2('Admin@123',256), '10k+', NOW());
           SQL
           sudo apt-get install -y mysql-client
           mysql -h 127.0.0.1 -uroot -proot wisebuddy < seed.sql
 
-      - name: Run API
+      - name: Run API (com Actuator e health probes)
         run: |
           nohup java -jar target/*.jar \
             --spring.datasource.url=jdbc:mysql://127.0.0.1:3306/wisebuddy \
-            --spring.datasource.username=root --spring.datasource.password=root \
-            --server.port=8085 --spring.profiles.active=prod > api.log 2>&1 &
-          echo $! > api.pid
-          sleep 20
-          (curl -sSf http://127.0.0.1:8085/v3/api-docs || curl -sSf http://127.0.0.1:8085/) >/dev/null
+            --spring.datasource.username=root \
+            --spring.datasource.password=root \
+            --server.port=8085 \
+            --spring.profiles.active=prod \
+            --management.endpoints.web.exposure.include=health,prometheus \
+            --management.endpoint.health.show-details=when_authorized \
+            --management.endpoint.health.probes.enabled=true \
+            --PII_AES_KEY="${PII_AES_KEY}" \
+            > api.log 2>&1 &
 
-      - name: Wait API up
+          echo $! > api.pid
+
+      - name: Wait API up (readiness probe via Actuator)
         run: |
-          for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:8085/v3/api-docs >/dev/null; then
-              echo "API UP"; exit 0
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:8085/actuator/health/readiness | grep -q '"status":"UP"'; then
+              echo "API READY"; exit 0
             fi
             sleep 2
           done
-          echo "API didn't start in time"; cat api.log || true; exit 1
+          echo "API didn't become READY in time"; echo "---- api.log (tail) ----"; tail -n 200 api.log || true; exit 1
 
       # ---------- DAST (OWASP ZAP) ----------
       - name: ZAP Baseline (throttled)
@@ -125,258 +148,110 @@ jobs:
           target: "http://127.0.0.1:8085"
           rules_file_name: ".zap/rules.tsv"
           cmd_options: >
-            -m 5                  # minutos de spider/passive scan
-            -I                    # não falha em WARN
-            -a                    # incluir regras do passive scan
-            --auto                # usa automation framework
+            -m 5
+            -I
+            -a
+            --auto
             -z "spider.maxDuration=2"
-          artifact_name: "zap-scan"   # <-- nome corrigido
+          artifact_name: "zap-scan"
         continue-on-error: true
 
-      - name: Collect ZAP
+      - name: Collect ZAP + API logs
         run: |
           mkdir -p security-reports/api
           [ -f report_html.html ] && mv report_html.html security-reports/api/zap.html || true
           [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json || true
           [ -f api.log ] && mv api.log security-reports/api/api.log || true
 
-
       # ---------- RELATÓRIO (HTML + PDF rico) ----------
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      
+
       - name: Build rich HTML report
         run: |
           mkdir -p security-reports
           node <<'NODE'
           const fs = require('fs');
-      
-          // Helpers
-          const safeRead = (p, fallback) => {
-            try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
-          };
+          const safeRead = (p, fallback) => { try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch { return fallback; } };
           const exists = p => { try { fs.accessSync(p); return true; } catch { return false; } };
           const esc = s => String(s??'').replace(/[&<>]/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[m]));
-      
-          // >>> Novo: embute conteúdo de arquivos no HTML (para o PDF levar junto)
           function embedFile(path, label, limit=8000) {
             if (!exists(path)) return '';
             let content = fs.readFileSync(path, 'utf8');
             const shown = content.length > limit ? content.slice(0, limit) + "\n...[truncado]..." : content;
-            return `
-              <details>
-                <summary><b>${esc(label)}</b> <span class="small">(${esc(path)})</span></summary>
-                <pre>${esc(shown)}</pre>
-              </details>
-            `;
+            return `<details><summary><b>${esc(label)}</b> <span class="small">(${esc(path)})</span></summary><pre>${esc(shown)}</pre></details>`;
           }
-      
-          // Load artifacts (se existirem)
           const semgrepJava = safeRead('semgrep-java.json', {results:[]});
           const semgrepJs   = safeRead('semgrep-js.json',   {results:[]});
           const zap         = safeRead('security-reports/api/zap.json', {site:[]});
           const depcheck    = safeRead('security-reports/api/depcheck.json', {dependencies:[]});
           const apiLog      = exists('security-reports/api/api.log') ? fs.readFileSync('security-reports/api/api.log','utf8') : '';
-      
-          // ---- SAST (Semgrep) ----
           const sgAll = [...semgrepJava.results, ...semgrepJs.results];
           const sevOrder = {ERROR:3, WARNING:2, INFO:1, LOW:1, MEDIUM:2, HIGH:3};
-          const sgCounts = sgAll.reduce((acc,r)=>{ const s=r.extra?.severity||'INFO'; acc[s]=(acc[s]||0)+1; return acc; },{});
-          const sgTop = sgAll
-            .sort((a,b)=> (sevOrder[b.extra?.severity||'INFO'] - sevOrder[a.extra?.severity||'INFO']))
-            .slice(0,20)
-            .map(r=>({
-              id: r.check_id,
-              sev: r.extra?.severity,
-              msg: r.extra?.message,
-              file: r.path,
-              line: r.start?.line,
-              cwe: r.extra?.metadata?.cwe?.[0] || r.extra?.metadata?.cwe || '',
-              owasp: r.extra?.metadata?.owasp || ''
-            }));
-      
-          const tipBySev = s => ({
-            'ERROR':'Corrija imediatamente. Implemente validação/escape, saneamento de inputs e políticas de authz. Adicione testes cobrindo o caso.',
-            'WARNING':'Planeje correção. Endureça configurações (headers, timeouts, validação), evite APIs inseguras.',
-            'INFO':'Boa prática: revise e considere hardening.'
-          }[s] || 'Revise e corrija conforme aplicável.');
-      
-          // ---- DAST (ZAP) ----
-          const zapAlerts = [];
-          (zap.site||[]).forEach(site=>{
-            (site.alerts||[]).forEach(a=>{
-              const inst = (a.instances||[]).slice(0,3).map(i=>({
-                uri: i.uri, method: i.method, evidence: i.evidence, attack: i.attack
-              }));
-              zapAlerts.push({
-                pluginId: a.pluginid || a.id,
-                name: a.alert || a.name,
-                risk: a.risk || a.riskcode || a.severity,
-                confidence: a.confidence,
-                desc: a.desc,
-                solution: a.solution,
-                ref: a.reference,
-                count: a.count || inst.length || 1,
-                instances: inst
-              });
-            });
-          });
-          const riskOrder = { 'High':3, 'Medium':2, 'Low':1, 'Informational':0, 'Info':0 };
-          const zapCounts = zapAlerts.reduce((acc,a)=>{ const r=a.risk||'Info'; acc[r]=(acc[r]||0)+1; return acc; },{});
-          const zapTop = zapAlerts.sort((a,b)=> (riskOrder[b.risk||'Info'] - riskOrder[a.risk||'Info'])).slice(0,15);
-      
-          // ---- SCA (Dependency-Check) ----
-          const deps = (depcheck.dependencies||[]).flatMap(d=>{
-            const vulns = d.vulnerabilities || [];
-            return vulns.map(v=>({
-              name: d.fileName || d.name || d.packagePath || 'unknown',
-              purl: d.packagePath || '',
-              id: v.name || v.cve || v.id,
-              desc: v.description,
-              score: v.cvssScore || v.cvssv3?.baseScore || v.cvssv2?.score,
-              severity: v.severity || ( (v.cvssScore>=9) ? 'CRITICAL' : (v.cvssScore>=7?'HIGH': (v.cvssScore>=4?'MEDIUM':'LOW')) ),
-              refs: (v.references||[]).map(r=>r.url).filter(Boolean).slice(0,3)
-            }));
-          });
-          const scaCounts = deps.reduce((a,v)=>{ a[v.severity]=(a[v.severity]||0)+1; return a; },{});
-          const depsTop = deps.sort((a,b)=> ( (b.score||0) - (a.score||0) )).slice(0,20);
-      
-          // ---- Sumário executivo ----
-          const sum = {
-            semgrepTotal: sgAll.length, semgrepBy: sgCounts,
-            zapTotal: zapAlerts.length, zapBy: zapCounts,
-            scaTotal: deps.length, scaBy: scaCounts
-          };
-      
-          const css = `
-            body{font-family:Arial,Helvetica,sans-serif;margin:24px}
-            h1{margin-bottom:4px} h2{margin-top:28px}
-            .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-            .card{border:1px solid #ddd;border-radius:10px;padding:12px}
-            table{width:100%;border-collapse:collapse;margin-top:8px}
-            th,td{border:1px solid #e5e5e5;padding:6px;text-align:left;font-size:14px;vertical-align:top}
-            th{background:#f7f7f7}
-            .sev-ERROR{color:#a40000;font-weight:700}
-            .sev-WARNING{color:#a66b00;font-weight:700}
-            .sev-INFO{color:#555}
-            .risk-High{color:#a40000;font-weight:700}
-            .risk-Medium{color:#a66b00;font-weight:700}
-            .risk-Low,.risk-Info{color:#555}
-            code,pre{background:#111;color:#eee;padding:8px;border-radius:6px;overflow:auto}
-            details{margin:8px 0}
-            .small{font-size:12px;color:#666}
-          `;
-      
-          const renderCounts = (obj) => {
-            const entries = Object.entries(obj||{}).sort((a,b)=> (b[1]-a[1]));
-            if (!entries.length) return '<p class="small">Sem achados.</p>';
-            return `<table><tr><th>Categoria</th><th>Qtde</th></tr>${
-              entries.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join('')
-            }</table>`;
-          };
-      
-          // Monta HTML
-          let html = `<!doctype html>
-          <html><head><meta charset="utf-8"><title>Relatório de Segurança - API</title>
-          <style>${css}</style></head><body>
-            <h1>Relatório de Segurança — WiseBuddy API</h1>
-            <p class="small">Gerado em ${new Date().toISOString()} | Pipeline: SAST (Semgrep), DAST (OWASP ZAP), SCA (Dependency-Check), Secret Scan (Gitleaks)</p>
-      
-            <h2>Sumário Executivo</h2>
-            <div class="grid">
-              <div class="card"><b>SAST (Semgrep)</b>${renderCounts(sum.semgrepBy)}<p>Total: <b>${sum.semgrepTotal}</b></p></div>
-              <div class="card"><b>DAST (ZAP)</b>${renderCounts(sum.zapBy)}<p>Total: <b>${sum.zapTotal}</b></p></div>
-              <div class="card"><b>SCA (Dependências)</b>${renderCounts(sum.scaBy)}<p>Total: <b>${sum.scaTotal}</b></p></div>
-            </div>
-      
-            <h2>Tarefa 1 — SAST (Semgrep)</h2>
-            <p>Vulnerabilidades classificadas por severidade (Semgrep). Recomendações rápidas por severidade.</p>
-            ${renderCounts(sum.semgrepBy)}
-            <p class="small"><b>Recomendações:</b> ERROR → ${tipBySev('ERROR')} | WARNING → ${tipBySev('WARNING')} | INFO → ${tipBySev('INFO')}</p>
-            <table>
-              <tr><th>Sev.</th><th>Regra</th><th>Arquivo</th><th>Linha</th><th>Descrição</th><th>Referências</th></tr>
-              ${sgTop.map(r=>`
-                <tr>
-                  <td class="sev-${esc(r.sev)}">${esc(r.sev||'')}</td>
-                  <td><code>${esc(r.id||'')}</code></td>
-                  <td>${esc(r.file||'')}</td>
-                  <td>${esc(r.line||'')}</td>
-                  <td>${esc(r.msg||'')}</td>
-                  <td class="small">
-                    ${r.cwe ? `CWE: ${esc(r.cwe)}<br>`:''}
-                    ${r.owasp ? `OWASP: ${esc(r.owasp)}`:''}
-                  </td>
-                </tr>
-              `).join('') || '<tr><td colspan="6">Sem achados relevantes.</td></tr>'}
-            </table>
-      
-            <h2>Tarefa 2 — DAST (OWASP ZAP)</h2>
-            <p>Varredura dinâmica com evidências e payloads (quando disponíveis).</p>
-            ${renderCounts(sum.zapBy)}
-            <table>
-              <tr><th>Risco</th><th>Alerta</th><th>Evidências / Payloads</th><th>Mitigação sugerida</th></tr>
-              ${zapTop.map(a=>`
-                <tr>
-                  <td class="risk-${esc(a.risk||'Info')}">${esc(a.risk||'Info')}</td>
-                  <td><b>${esc(a.name||'')}</b><br><span class="small">Confiança: ${esc(a.confidence||'')}</span></td>
-                  <td class="small">
-                    ${(a.instances||[]).map(i=>`
-                      <div>
-                        <div><b>${esc(i.method||'GET')}</b> ${esc(i.uri||'')}</div>
-                        ${i.attack? `<div>Payload: <code>${esc(i.attack)}</code></div>`:''}
-                        ${i.evidence? `<div>Evidência: <code>${esc(i.evidence)}</code></div>`:''}
-                      </div>
-                    `).join('') || '—'}
-                  </td>
-                  <td class="small">${esc(a.solution||'Consultar referências OWASP e aplicar hardening/validação.')}</td>
-                </tr>
-              `).join('') || '<tr><td colspan="4">Sem achados.</td></tr>'}
-            </table>
-      
-            <h2>Tarefa 3 — SCA (Dependency-Check)</h2>
-            <p>Dependências com CVEs e riscos. Sugestão: atualizar para versões corrigidas ou substituir por libs mantidas.</p>
-            ${renderCounts(sum.scaBy)}
-            <table>
-              <tr><th>Sev.</th><th>Biblioteca</th><th>CVE/ID</th><th>Score</th><th>Descrição</th><th>Referências</th></tr>
-              ${depsTop.map(v=>`
-                <tr>
-                  <td>${esc(v.severity||'')}</td>
-                  <td><code>${esc(v.name||'')}</code></td>
-                  <td>${esc(v.id||'')}</td>
-                  <td>${esc(v.score||'')}</td>
-                  <td class="small">${esc((v.desc||'').substring(0,300))}${(v.desc||'').length>300?'...':''}</td>
-                  <td class="small">${(v.refs||[]).map(u=>`<div><a href="${esc(u)}">${esc(u)}</a></div>`).join('') || '—'}</td>
-                </tr>
-              `).join('') || '<tr><td colspan="6">Sem achados.</td></tr>'}
-            </table>
-      
-            <h2>Tarefa 4 — Integração e Monitoramento CI/CD</h2>
-            <ul>
-              <li><b>Gatilhos:</b> push/PR em qualquer branch + manual (workflow_dispatch)</li>
-              <li><b>Gates:</b> falha em Semgrep (ERROR/WARNING) e em SCA (CVSS ≥ 9); ZAP gera evidências sem bloquear.</li>
-              <li><b>Notificações:</b> envio de e-mail (SMTP) com PDF anexado nas execuções de push.</li>
-              <li><b>Logs:</b> trecho do log da API durante o DAST:</li>
-            </ul>
-            <pre>${esc(apiLog.split('\n').slice(-80).join('\n'))}</pre>
-      
-            <h2>Artefatos Embutidos</h2>
-            ${embedFile('security-reports/api/zap.html','ZAP (HTML)')}
-            ${embedFile('semgrep-java.json','Semgrep Java (JSON)')}
-            ${embedFile('semgrep-js.json','Semgrep JS (JSON)')}
-            ${embedFile('gitleaks.json','Gitleaks (JSON)')}
-      
+          const sgCounts = sgAll.reduce((a,r)=>{ const s=r.extra?.severity||'INFO'; a[s]=(a[s]||0)+1; return a; },{});
+          const sgTop = sgAll.sort((a,b)=> (sevOrder[b.extra?.severity||'INFO']-sevOrder[a.extra?.severity||'INFO'])).slice(0,20).map(r=>({
+            id:r.check_id, sev:r.extra?.severity, msg:r.extra?.message, file:r.path, line:r.start?.line,
+            cwe:r.extra?.metadata?.cwe?.[0]||r.extra?.metadata?.cwe||'', owasp:r.extra?.metadata?.owasp||''
+          }));
+          const zapAlerts=[]; (zap.site||[]).forEach(s=> (s.alerts||[]).forEach(a=>{
+            const inst=(a.instances||[]).slice(0,3).map(i=>({uri:i.uri,method:i.method,evidence:i.evidence,attack:i.attack}));
+            zapAlerts.push({pluginId:a.pluginid||a.id,name:a.alert||a.name,risk:a.risk||a.riskcode||a.severity,confidence:a.confidence,desc:a.desc,solution:a.solution,ref:a.reference,count:a.count||inst.length||1,instances:inst});
+          }));
+          const riskOrder={'High':3,'Medium':2,'Low':1,'Informational':0,'Info':0};
+          const zapCounts=zapAlerts.reduce((a,z)=>{const r=z.risk||'Info';a[r]=(a[r]||0)+1;return a;},{}); const zapTop=zapAlerts.sort((a,b)=> (riskOrder[b.risk||'Info']-riskOrder[a.risk||'Info'])).slice(0,15);
+          const deps=(depcheck.dependencies||[]).flatMap(d=> (d.vulnerabilities||[]).map(v=>({
+            name:d.fileName||d.name||d.packagePath||'unknown', purl:d.packagePath||'', id:v.name||v.cve||v.id,
+            desc:v.description, score:v.cvssScore||v.cvssv3?.baseScore||v.cvssv2?.score,
+            severity:v.severity || ((v.cvssScore>=9)?'CRITICAL':(v.cvssScore>=7?'HIGH':(v.cvssScore>=4?'MEDIUM':'LOW'))),
+            refs:(v.references||[]).map(r=>r.url).filter(Boolean).slice(0,3)
+          })));
+          const scaCounts=deps.reduce((a,v)=>{a[v.severity]=(a[v.severity]||0)+1;return a;},{});
+          const depsTop=deps.sort((a,b)=>((b.score||0)-(a.score||0))).slice(0,20);
+          const sum={semgrepTotal:sgAll.length,semgrepBy:sgCounts,zapTotal:zapAlerts.length,zapBy:zapCounts,scaTotal:deps.length,scaBy:scaCounts};
+          const css=`body{font-family:Arial,Helvetica,sans-serif;margin:24px}h1{margin-bottom:4px}h2{margin-top:28px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.card{border:1px solid #ddd;border-radius:10px;padding:12px}table{width:100%;border-collapse:collapse;margin-top:8px}th,td{border:1px solid #e5e5e5;padding:6px;text-align:left;font-size:14px;vertical-align:top}th{background:#f7f7f7}.sev-ERROR{color:#a40000;font-weight:700}.sev-WARNING{color:#a66b00;font-weight:700}.sev-INFO{color:#555}.risk-High{color:#a40000;font-weight:700}.risk-Medium{color:#a66b00;font-weight:700}.risk-Low,.risk-Info{color:#555}code,pre{background:#111;color:#eee;padding:8px;border-radius:6px;overflow:auto}details{margin:8px 0}.small{font-size:12px;color:#666}`;
+          const renderCounts=obj=>{const e=Object.entries(obj||{}).sort((a,b)=>(b[1]-a[1])); if(!e.length) return '<p class="small">Sem achados.</p>'; return `<table><tr><th>Categoria</th><th>Qtde</th></tr>${e.map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join('')}</table>`;}
+          const tipBySev=s=>({'ERROR':'Corrija imediatamente. Implemente validação/escape, saneamento de inputs e authz.','WARNING':'Planeje correção. Endureça configs e evite APIs inseguras.','INFO':'Boa prática: revise e considere hardening.'}[s]||'Revise e corrija conforme aplicável.');
+          let html = `<!doctype html><html><head><meta charset="utf-8"><title>Relatório de Segurança - API</title><style>${css}</style></head><body>
+          <h1>Relatório de Segurança — WiseBuddy API</h1>
+          <p class="small">Gerado em ${new Date().toISOString()} | Pipeline: SAST (Semgrep), DAST (ZAP), SCA (Dependency-Check), Secret Scan (Gitleaks)</p>
+          <h2>Sumário Executivo</h2><div class="grid">
+          <div class="card"><b>SAST (Semgrep)</b>${renderCounts(sum.semgrepBy)}<p>Total: <b>${sum.semgrepTotal}</b></p></div>
+          <div class="card"><b>DAST (ZAP)</b>${renderCounts(sum.zapBy)}<p>Total: <b>${sum.zapTotal}</b></p></div>
+          <div class="card"><b>SCA (Dependências)</b>${renderCounts(sum.scaBy)}<p>Total: <b>${sum.scaTotal}</b></p></div></div>
+          <h2>Tarefa 1 — SAST (Semgrep)</h2>${renderCounts(sum.semgrepBy)}
+          <p class="small"><b>Recomendações:</b> ERROR → ${tipBySev('ERROR')} | WARNING → ${tipBySev('WARNING')} | INFO → ${tipBySev('INFO')}</p>
+          <table><tr><th>Sev.</th><th>Regra</th><th>Arquivo</th><th>Linha</th><th>Descrição</th><th>Referências</th></tr>${
+            (sgTop.length? sgTop.map(r=>`<tr><td class="sev-${esc(r.sev)}">${esc(r.sev||'')}</td><td><code>${esc(r.id||'')}</code></td><td>${esc(r.file||'')}</td><td>${esc(r.line||'')}</td><td>${esc(r.msg||'')}</td><td class="small">${r.cwe?`CWE: ${esc(r.cwe)}<br>`:''}${r.owasp?`OWASP: ${esc(r.owasp)}`:''}</td></tr>`).join('') : '<tr><td colspan="6">Sem achados relevantes.</td></tr>')
+          }</table>
+          <h2>Tarefa 2 — DAST (OWASP ZAP)</h2>${renderCounts(sum.zapBy)}
+          <table><tr><th>Risco</th><th>Alerta</th><th>Evidências / Payloads</th><th>Mitigação sugerida</th></tr>${
+            (zapTop.length? zapTop.map(a=>`<tr><td class="risk-${esc(a.risk||'Info')}">${esc(a.risk||'Info')}</td><td><b>${esc(a.name||'')}</b><br><span class="small">Confiança: ${esc(a.confidence||'')}</span></td><td class="small">${
+              (a.instances||[]).map(i=>`<div><div><b>${esc(i.method||'GET')}</b> ${esc(i.uri||'')}</div>${i.attack?`<div>Payload: <code>${esc(i.attack)}</code></div>`:''}${i.evidence?`<div>Evidência: <code>${esc(i.evidence)}</code></div>`:''}</div>`).join('')
+            || '—'}</td><td class="small">${esc(a.solution||'Consultar OWASP e aplicar hardening/validação.')}</td></tr>`).join('') : '<tr><td colspan="4">Sem achados.</td></tr>')
+          }</table>
+          <h2>Tarefa 3 — SCA (Dependency-Check)</h2>${renderCounts(sum.scaBy)}
+          <table><tr><th>Sev.</th><th>Biblioteca</th><th>CVE/ID</th><th>Score</th><th>Descrição</th><th>Referências</th></tr>${
+            (depsTop.length? depsTop.map(v=>`<tr><td>${esc(v.severity||'')}</td><td><code>${esc(v.name||'')}</code></td><td>${esc(v.id||'')}</td><td>${esc(v.score||'')}</td><td class="small">${esc((v.desc||'').substring(0,300))}${(v.desc||'').length>300?'...':''}</td><td class="small">${(v.refs||[]).map(u=>`<div><a href="${esc(u)}">${esc(u)}</a></div>`).join('')||'—'}</td></tr>`).join('') : '<tr><td colspan="6">Sem achados.</td></tr>')
+          }</table>
+          <h2>Tarefa 4 — Integração e Monitoramento CI/CD</h2>
+          <ul><li><b>Gatilhos:</b> push/PR + manual</li><li><b>Gates:</b> falha em Semgrep (ERROR/WARNING) e SCA (CVSS ≥ 9); ZAP gera evidências.</li><li><b>Logs:</b> trecho do log da API durante o DAST:</li></ul>
+          <pre>${esc(apiLog.split('\n').slice(-120).join('\n'))}</pre>
+          <h2>Artefatos Embutidos</h2>
+          ${embedFile('security-reports/api/zap.html','ZAP (HTML)')}
+          ${embedFile('semgrep-java.json','Semgrep Java (JSON)')}
+          ${embedFile('semgrep-js.json','Semgrep JS (JSON)')}
+          ${embedFile('gitleaks.json','Gitleaks (JSON)')}
           </body></html>`;
-      
           fs.writeFileSync('security-reports/index.html', html);
           console.log('OK: security-reports/index.html gerado');
           NODE
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api-html
           path: security-reports/index.html
-      
+
       - name: Generate PDF (rich)
         run: |
           npm i puppeteer@23
@@ -390,12 +265,11 @@ jobs:
               await b.close();
             })();
           "
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api-pdf
           path: security-reports/security-report-api.pdf
-
 
       # ---------- Gates ----------
       - name: Fail on Semgrep High/Critical
