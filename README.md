@@ -48,7 +48,7 @@ docker run --name wisebuddy-mysql -e MYSQL_ROOT_PASSWORD=123 -e MYSQL_DATABASE=w
 
 ---
 
-## Documentação Swagger
+## Documentação Swagger 
 
 Após iniciar a API, acesse a documentação interativa pelo navegador:
 
