@@ -1,4 +1,4 @@
-# Wise Buddy API
+# Wise Buddy API 
 
 ## Descrição
 
