@@ -1,0 +1,22 @@
+name: Dependabot
+
+on:
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  Dependabot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Non-Dependabot PR → pass
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        run: echo "Not a Dependabot PR. Passing the check."
+
+      - name: Dependabot PR → fetch metadata
+        if: ${{ github.actor == 'dependabot[bot]' }}
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          

@@ -1,8 +1,30 @@
 version: 2
 updates:
+  # Maven (pom.xml)
   - package-ecosystem: "maven"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+    open-pull-requests-limit: 10
+    # habilita PRs de segurança automáticos
+    allow:
+      - dependency-type: "all"
+    groups:
+      spring:
+        patterns:
+          - "org.springframework*"
+          - "org.springdoc*"
+      bucket4j:
+        patterns:
+          - "com.bucket4j*"
+    labels: ["dependencies", "security"]
+    reviewers: []
+    assignees: []
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
     open-pull-requests-limit: 5
-    labels: ["security","dependencies"]
+    labels: ["dependencies", "security"]
